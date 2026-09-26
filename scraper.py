@@ -1,159 +1,195 @@
+import argparse
+import logging
+import sqlite3
+import time
+from datetime import datetime
+from pathlib import Path
+from urllib.parse import urlencode, urljoin
+
 import requests
 from bs4 import BeautifulSoup
-import pandas as pd
-import os
-import time
-import sqlite3
 
-base_url = "https://www.bazos.sk"
-target_url = "https://www.bazos.sk/search.php?hledat=honda+civic+1.8+vtec&rubriky=www&hlokalita=&humkreis=25&cenaod=&cenado=&Submit=H%C4%BEada%C5%A5&order=&kitx=ano"
+BASE_URL = "https://www.bazos.sk"
+SEARCH_URL = urljoin(BASE_URL, "/search.php")
+DEFAULT_QUERY = "honda civic 1.8 vtec"
 
-# file in which we save the extracted data
-export_file_name = 'Honda_civic_1.8_vtec.csv'
+# resolved relative to the script so cron can run it from any directory
+DB_PATH = Path(__file__).parent / "bazos_cars.db"
 
-# identities for requests
+# listings cheaper than this are usually parts or wrecks, not whole cars
+MIN_PRICE_EUR = 500
+
+PAGE_SIZE = 20
+
+REQUEST_DELAY = 1
+
 HEADERS = {
-    "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/91.0.4472.124 Safari/537.36"
-} 
+    "User-Agent": "bazos-car-scraper/1.0 (+https://jakubferencik.com)"
+}
 
-def site_download(url):
-    print("Stahujem zdrojovy kod stranky.")
+logger = logging.getLogger(__name__)
 
-    response = requests.get(url, headers=HEADERS)
-    if response.status_code != 200:
-        #print("Problem pri naciavani stranky.")
-        return None
-    else:
-        return BeautifulSoup(response.text, "html.parser")
-    
-# finds offer card
-def find_offers(soup):
-    cards = soup.find_all("div", {"class" : "inzeraty inzeratyflex"})
-    return cards
 
-def extract_information(cards):
-    data = []
-    for card in cards:
-        # find the h2 with class 'nadpis', then get the 'a' tag inside
-        title_element = card.find('h2', class_='nadpis')
-        
-        # check if element exists to avoid crashes
-        if title_element and title_element.find('a'):
-            title = title_element.find('a').text.strip()
-            link = title_element.find('a')['href']
-        else:
-            link = None
-            title = None
+def build_search_url(query, offset):
+    params = {
+        "hledat": query,
+        "rubriky": "www",
+        "hlokalita": "",
+        "humkreis": 25,
+        "cenaod": "",
+        "cenado": "",
+        "order": "",
+        "kitx": "ano",
+        "crz": offset,
+    }
+    return f"{SEARCH_URL}?{urlencode(params)}"
 
-        # extract price
-        price_element = card.find('div', class_='inzeratycena')
-        raw_price = price_element.text.strip()
 
-        # extract location
-        location_element = card.find('div', class_='inzeratylok')
-        location = location_element.text.strip() if location_element else None
-
-        # filtering logic
-        is_car_valid = True
-
-        if raw_price:
-            clean_price = raw_price.replace("€", "").replace(" ", "")
-            if clean_price.isnumeric():
-                price_number = int(clean_price)
-
-                # basic filter for car parts and wrecks
-                if price_number < 500:
-                    is_car_valid = False
-
-            # try to keep all the non numeric price values("dohodou", "ponuknite")
-            else:
-                pass
-
-        # store the pair
-        if title and link and is_car_valid:
-            data.append({
-                'name': title,
-                'price': raw_price,
-                'location': location,
-                'link' : link
-            })
-
-    return data
-
-def save_to_db(dictionary_of_offers):
-
-    if not dictionary_of_offers:
-        print("Nemam co zapisat.")
-        return
-    
-    # turning dictionary into pandas dataframe
-    new_df = pd.DataFrame(dictionary_of_offers)
-    db_name = 'bazos_cars.db' 
-
-    # connect to database
-    # if its non-existant we create it
-    connection = sqlite3.connect(db_name)
+def download_page(url):
+    logger.info("Downloading %s", url)
 
     try:
-        # load links from database
-        existing_links = pd.read_sql("SELECT link FROM cars", connection)
-        
-        # filter by link
-        only_new_cars = new_df[~new_df['link'].isin(existing_links['link'])]
+        response = requests.get(url, headers=HEADERS, timeout=10)
+    except requests.RequestException as e:
+        logger.error("Request failed: %s", e)
+        return None
 
-    except pd.errors.DatabaseError:
-        # case for clean save file (first run)
-        print("Tabulka v databaze este neexistuje, vytvaram novu...")
-        only_new_cars = new_df
+    if response.status_code != 200:
+        logger.error("Unexpected HTTP status %s", response.status_code)
+        return None
 
-    except Exception as e:
-        print(f"Ina chyba pri citani databazy: {e}")
-        only_new_cars = pd.DataFrame() # Empty dataframe to prevent crash
+    return BeautifulSoup(response.text, "html.parser")
 
-    if not only_new_cars.empty:
-        print(f"Zapisujem {len(only_new_cars)} novych aut do SQL databazy.")
-        
-        # appends new data
-        only_new_cars.to_sql('cars', connection, if_exists='append', index=False)
-    else:
-        print("Ziadne nove inzeraty (vsetky uz su v databaze).")
-    connection.close()
+
+def find_listings(soup):
+    return soup.find_all("div", {"class": "inzeraty inzeratyflex"})
+
+
+def parse_price(raw_price):
+    # "3 500 €" -> 3500, "Dohodou" -> None
+    clean_price = "".join(raw_price.replace("€", "").split())
+    if clean_price.isdigit():
+        return int(clean_price)
+    return None
+
+
+def extract_listings(cards):
+    listings = []
+    for card in cards:
+        title_element = card.find("h2", class_="nadpis")
+        link_element = title_element.find("a") if title_element else None
+        if not link_element or not link_element.get("href"):
+            continue
+
+        title = link_element.text.strip()
+        link = urljoin(BASE_URL, link_element["href"])
+
+        price_element = card.find("div", class_="inzeratycena")
+        raw_price = price_element.text.strip() if price_element else None
+
+        location_element = card.find("div", class_="inzeratylok")
+        # the city and postcode are separated by <br>, so join the text parts with a space
+        location = location_element.get_text(" ", strip=True) if location_element else None
+
+        price_eur = parse_price(raw_price) if raw_price else None
+
+        # skip parts and wrecks; listings without a numeric price ("Dohodou") are kept
+        if price_eur is not None and price_eur < MIN_PRICE_EUR:
+            continue
+
+        listings.append({
+            "link": link,
+            "title": title,
+            "price_eur": price_eur,
+            "price_raw": raw_price,
+            "location": location,
+        })
+
+    return listings
+
+
+def init_db(connection):
+    connection.execute("""
+        CREATE TABLE IF NOT EXISTS cars (
+            link       TEXT PRIMARY KEY,
+            title      TEXT,
+            price_eur  INTEGER,
+            price_raw  TEXT,
+            location   TEXT,
+            first_seen TEXT
+        )
+    """)
+    connection.commit()
+
+
+def save_listings(connection, listings):
+    first_seen = datetime.now().isoformat(timespec="seconds")
+    rows = [
+        (item["link"], item["title"], item["price_eur"], item["price_raw"], item["location"], first_seen)
+        for item in listings
+    ]
+
+    changes_before = connection.total_changes
+    # link is the primary key, so INSERT OR IGNORE skips listings already stored
+    connection.executemany(
+        "INSERT OR IGNORE INTO cars (link, title, price_eur, price_raw, location, first_seen) "
+        "VALUES (?, ?, ?, ?, ?, ?)",
+        rows,
+    )
+    connection.commit()
+    return connection.total_changes - changes_before
+
+
+def parse_args():
+    parser = argparse.ArgumentParser(description="Scrape used-car listings from bazos.sk into SQLite.")
+    parser.add_argument(
+        "query",
+        nargs="?",
+        default=DEFAULT_QUERY,
+        help=f'search query (default: "{DEFAULT_QUERY}")',
+    )
+    return parser.parse_args()
+
 
 def main():
-    # number of elements for every page
-    offset = 0 
+    logging.basicConfig(
+        level=logging.INFO,
+        format="%(asctime)s %(levelname)s %(message)s",
+    )
+    args = parse_args()
+    logger.info('Searching for "%s", saving to %s', args.query, DB_PATH)
 
-    while True:
+    connection = sqlite3.connect(DB_PATH)
+    init_db(connection)
 
-        # Url for looking through multiple pages 
-        current_url = f"{target_url}&crz={offset}"
+    offset = 0
+    total_new = 0
+    try:
+        while True:
+            soup = download_page(build_search_url(args.query, offset))
+            if soup is None:
+                logger.error("Could not load the page, stopping.")
+                break
 
-        # save the site
-        soup = site_download(current_url)
-    
-        # chek if we've saved the site
-        if soup == None:
-            print("Stranku sa nepodarilo nacitat.")
-            return
-    
-        # extract just the offer cards hrom html
-        cards = find_offers(soup)
+            cards = find_listings(soup)
+            # no cards means we went past the last page
+            if not cards:
+                break
 
-        # exit clause for when we have no more cards == end 
-        if not cards:
-            break
+            listings = extract_listings(cards)
+            new_rows = save_listings(connection, listings)
+            total_new += new_rows
+            logger.info(
+                "Page at offset %d: %d cards, %d kept after filtering, %d new",
+                offset, len(cards), len(listings), new_rows,
+            )
 
-        print(f"Nasiel som {len(cards)} inzeratov na tejto strane")
+            offset += PAGE_SIZE
+            time.sleep(REQUEST_DELAY)
+    finally:
+        connection.close()
 
-        # extract for us important information from the cards
-        offers = extract_information(cards)
-
-        # we save the information into a file
-        save_to_db(offers)
-
-        offset+=20
-        time.sleep(1)
-
+    logger.info("Done. %d new listings in total.", total_new)
 
 
 if __name__ == "__main__":
