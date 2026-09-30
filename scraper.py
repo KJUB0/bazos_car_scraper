@@ -1,7 +1,9 @@
 import argparse
 import logging
+import re
 import sqlite3
 import time
+import unicodedata
 from datetime import datetime
 from pathlib import Path
 from urllib.parse import urlencode, urljoin
@@ -18,6 +20,9 @@ DB_PATH = Path(__file__).parent / "bazos_cars.db"
 
 # listings cheaper than this are usually parts or wrecks, not whole cars
 MIN_PRICE_EUR = 500
+
+# a number followed by "km"
+MILEAGE_PATTERN = re.compile(r"(\d{1,3}(?:[ .]\d{3})+|\d+)\s*(xxx|tis(?:ic)?\.?|k)?\s*km\b", re.IGNORECASE)
 
 PAGE_SIZE = 20
 
@@ -72,6 +77,25 @@ def parse_price(raw_price):
         return int(clean_price)
     return None
 
+def remove_diacritics(text):
+    text = unicodedata.normalize("NFKD", text)
+    return "".join(c for c in text if not unicodedata.combining(c))
+
+
+def parse_mileage(text):
+    match = MILEAGE_PATTERN.search(remove_diacritics(text))
+    if not match:
+        return None
+
+    number = int(match.group(1).replace(" ", "").replace(".", ""))
+    if match.group(2):
+        number *= 1000
+
+    # below 1000 it's usually something else, like a distance ("50 km od Bratislavy")
+    if not 1000 <= number <= 1_000_000:
+        return None
+    return number
+
 
 def extract_listings(cards):
     listings = []
@@ -93,6 +117,11 @@ def extract_listings(cards):
 
         price_eur = parse_price(raw_price) if raw_price else None
 
+        # search results only show the start of the description, so mileage is often missing
+        description_element = card.find("div", class_="popis")
+        description = description_element.get_text(" ", strip=True) if description_element else ""
+        mileage_km = parse_mileage(f"{title} {description}")
+
         # skip parts and wrecks; listings without a numeric price ("Dohodou") are kept
         if price_eur is not None and price_eur < MIN_PRICE_EUR:
             continue
@@ -103,6 +132,7 @@ def extract_listings(cards):
             "price_eur": price_eur,
             "price_raw": raw_price,
             "location": location,
+            "mileage_km": mileage_km,
         })
 
     return listings
@@ -116,24 +146,30 @@ def init_db(connection):
             price_eur  INTEGER,
             price_raw  TEXT,
             location   TEXT,
-            first_seen TEXT
+            first_seen TEXT,
+            mileage_km INTEGER
         )
     """)
+
+    columns = [row[1] for row in connection.execute("PRAGMA table_info(cars)")]
+    if "mileage_km" not in columns:
+        connection.execute("ALTER TABLE cars ADD COLUMN mileage_km INTEGER")
+
     connection.commit()
 
 
 def save_listings(connection, listings):
     first_seen = datetime.now().isoformat(timespec="seconds")
     rows = [
-        (item["link"], item["title"], item["price_eur"], item["price_raw"], item["location"], first_seen)
+        (item["link"], item["title"], item["price_eur"], item["price_raw"], item["location"], item["mileage_km"], first_seen)
         for item in listings
     ]
 
     changes_before = connection.total_changes
     # link is the primary key, so INSERT OR IGNORE skips listings already stored
     connection.executemany(
-        "INSERT OR IGNORE INTO cars (link, title, price_eur, price_raw, location, first_seen) "
-        "VALUES (?, ?, ?, ?, ?, ?)",
+        "INSERT OR IGNORE INTO cars (link, title, price_eur, price_raw, location, mileage_km, first_seen) "
+        "VALUES (?, ?, ?, ?, ?, ?, ?)",
         rows,
     )
     connection.commit()

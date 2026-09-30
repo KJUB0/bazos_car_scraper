@@ -87,11 +87,13 @@
     <label>Search<input type="search" id="search" placeholder="Title or location"></label>
     <label>Min price (€)<input type="number" id="min-price" min="0" step="500"></label>
     <label>Max price (€)<input type="number" id="max-price" min="0" step="500"></label>
+    <label>Max mileage (km)<input type="number" id="max-km" min="0" step="10000"></label>
     <label>Sort by
       <select id="sort">
         <option value="newest">Newest first</option>
         <option value="cheapest">Cheapest first</option>
         <option value="expensive">Most expensive first</option>
+        <option value="mileage">Lowest mileage first</option>
       </select>
     </label>
     <label class="checkbox"><input type="checkbox" id="show-no-price" checked>&nbsp;Include listings without a price</label>
@@ -100,7 +102,7 @@
   <div class="table-wrap">
     <table>
       <thead>
-        <tr><th>Title</th><th class="price">Price</th><th>Location</th><th>First seen</th></tr>
+        <tr><th>Title</th><th class="price">Price</th><th class="price">Mileage</th><th>Location</th><th>First seen</th></tr>
       </thead>
       <tbody id="rows"></tbody>
     </table>
@@ -111,6 +113,7 @@
 <script>
   let allCars = [];
 
+  const numberFormat = new Intl.NumberFormat("sk-SK");
   const priceFormat = new Intl.NumberFormat("sk-SK", { style: "currency", currency: "EUR", maximumFractionDigits: 0 });
 
   function formatDate(iso) {
@@ -136,26 +139,30 @@
     const search = document.getElementById("search").value.trim().toLowerCase();
     const minPrice = parseInt(document.getElementById("min-price").value, 10);
     const maxPrice = parseInt(document.getElementById("max-price").value, 10);
+    const maxKm = parseInt(document.getElementById("max-km").value, 10);
     const showNoPrice = document.getElementById("show-no-price").checked;
     const sort = document.getElementById("sort").value;
 
     const cars = allCars.filter((car) => {
       const text = `${car.title} ${car.location || ""}`.toLowerCase();
       if (search && !text.includes(search)) return false;
+      // listings with unknown mileage are hidden only while the mileage filter is set
+      if (!isNaN(maxKm) && (car.mileage_km === null || car.mileage_km > maxKm)) return false;
       if (car.price_eur === null) return showNoPrice;
       if (!isNaN(minPrice) && car.price_eur < minPrice) return false;
       if (!isNaN(maxPrice) && car.price_eur > maxPrice) return false;
       return true;
     });
 
-    // listings without a price always go to the end when sorting by price
-    const byPrice = (a, b, direction) => {
-      if (a.price_eur === null) return 1;
-      if (b.price_eur === null) return -1;
-      return (a.price_eur - b.price_eur) * direction;
+    // listings without a value always go to the end when sorting by it
+    const byField = (field, direction) => (a, b) => {
+      if (a[field] === null) return 1;
+      if (b[field] === null) return -1;
+      return (a[field] - b[field]) * direction;
     };
-    if (sort === "cheapest") cars.sort((a, b) => byPrice(a, b, 1));
-    if (sort === "expensive") cars.sort((a, b) => byPrice(a, b, -1));
+    if (sort === "cheapest") cars.sort(byField("price_eur", 1));
+    if (sort === "expensive") cars.sort(byField("price_eur", -1));
+    if (sort === "mileage") cars.sort(byField("mileage_km", 1));
     if (sort === "newest") cars.sort((a, b) => b.first_seen.localeCompare(a.first_seen));
     return cars;
   }
@@ -194,6 +201,7 @@
       tr.append(
         titleCell,
         cell(car.price_eur !== null ? priceFormat.format(car.price_eur) : car.price_raw || "–", "price"),
+        cell(car.mileage_km !== null ? `${numberFormat.format(car.mileage_km)} km` : "–", "price"),
         cell(car.location || "–", "muted"),
         cell(formatDate(car.first_seen), "muted"),
       );
@@ -225,7 +233,7 @@
     render();
   }
 
-  for (const id of ["search", "min-price", "max-price", "sort", "show-no-price"]) {
+  for (const id of ["search", "min-price", "max-price", "max-km", "sort", "show-no-price"]) {
     document.getElementById(id).addEventListener("input", render);
   }
   load();

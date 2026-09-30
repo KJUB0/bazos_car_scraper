@@ -20,6 +20,7 @@ The scraper goes through the search results page by page until there are no more
    * Normalizes prices (removes "€" and spaces) into an integer `price_eur`.
    * Keeps the original price text in `price_raw`, so non-numeric prices are not lost.
    * Turns relative links into absolute URLs.
+   * Looks for a mileage (e.g. "178 000 km", "180tisic km", "324xxx km") in the title and the description preview. Bazos has no mileage field and the preview is cut short, so it is often missing.
 3. Storage: Inserts the listings with parameterized `INSERT OR IGNORE` queries and logs how many new listings each page added.
 4. Rate Limiting: Waits 1 second between page requests and identifies itself with an honest User-Agent (`bazos-car-scraper/1.0`).
 
@@ -34,6 +35,7 @@ Table `cars`:
 | `price_raw`  | TEXT    | Price exactly as shown on the site                                 |
 | `location`   | TEXT    | Location text from the listing                                     |
 | `first_seen` | TEXT    | ISO timestamp (local time) of when the scraper first stored it     |
+| `mileage_km` | INTEGER | Mileage found in the title/description text, `NULL` if not found   |
 
 ### How to run
 ```bash

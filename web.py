@@ -20,7 +20,7 @@ def load_cars():
     connection.row_factory = sqlite3.Row
     try:
         rows = connection.execute(
-            "SELECT link, title, price_eur, price_raw, location, first_seen "
+            "SELECT link, title, price_eur, price_raw, location, mileage_km, first_seen "
             "FROM cars ORDER BY first_seen DESC"
         ).fetchall()
     finally:
