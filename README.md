@@ -10,6 +10,7 @@ Unlike a simple "page downloader," this script includes logic to filter out nois
 * Storage: Stores all data in a local SQLite database (`bazos_cars.db`, next to the script).
 * Configurable search: The search query is a command-line argument.
 * Analysis: `analyze.py` draws charts from the collected data.
+* Web interface: `web.py` serves a simple page for browsing, filtering and sorting the stored listings (Python standard library only).
 
 ### Technical Implementation
 The scraper goes through the search results page by page until there are no more listings:
@@ -51,6 +52,12 @@ python scraper.py "skoda octavia"
 
 # generate charts into docs/
 python analyze.py
+
+# browse the listings at http://127.0.0.1:8000
+python web.py
+
+# on the homelab: make the page reachable from other devices on the local network
+python web.py --host 0.0.0.0 --port 8000
 
 # look at the data
 sqlite3 bazos_cars.db "SELECT title, price_eur, location FROM cars ORDER BY first_seen DESC LIMIT 10;"
